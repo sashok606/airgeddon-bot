@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.cap
+*.pcap
+handshake*
+nohup.out
+venv/

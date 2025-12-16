@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""
+Інтерактивний Telegram-бот для керування консольними програмами
+Запускає програми, передає вивід у TG, приймає ввід від користувача
+"""
+
+import asyncio
+import logging
+import os
+import sys
+from typing import Optional
+from enum import Enum
+
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from dotenv import load_dotenv
+
+# Завантажуємо змінні середовища
+load_dotenv()
+
+# Налаштування логування
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Конфігурація
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '0'))
+
+if not BOT_TOKEN or not ADMIN_CHAT_ID:
+    logger.error("BOT_TOKEN або ADMIN_CHAT_ID не налаштовані в .env файлі")
+    sys.exit(1)
+
+# Стани conversation
+class State(Enum):
+    WAITING_COMMAND = 1
+    PROCESS_RUNNING = 2
+
+# Глобальна змінна для процесу
+active_process: Optional[asyncio.subprocess.Process] = None
+output_task: Optional[asyncio.Task] = None
+
+# Клавіатура
+def get_main_keyboard():
+    """Головна клавіатура з кнопками"""
+    keyboard = [
+        [KeyboardButton("🚀 Start Program")],
+        [KeyboardButton("🛑 Stop Program"), KeyboardButton("📊 Status")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def send_long_message(bot: Bot, chat_id: int, text: str, max_length: int = 4000):
+    """Надсилає довгі повідомлення частинами"""
+    for i in range(0, len(text), max_length):
+        chunk = text[i:i + max_length]
+        await bot.send_message(chat_id, f"```\n{chunk}\n```", parse_mode="Markdown")
+        await asyncio.sleep(0.1)
+
+
+async def read_stream_and_send(stream, bot: Bot, chat_id: int, prefix: str = ""):
+    """Читає вивід з процесу та надсилає у Telegram"""
+    buffer = ""
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            
+            decoded = line.decode('utf-8', errors='replace').rstrip()
+            logger.info(f"{prefix}{decoded}")
+            buffer += decoded + "\n"
+            
+            # Надсилаємо по 10 рядків або кожні 2 секунди
+            if buffer.count('\n') >= 10:
+                await send_long_message(bot, chat_id, buffer)
+                buffer = ""
+            
+    except Exception as e:
+        logger.error(f"Помилка читання stream: {e}")
+    finally:
+        if buffer:
+            await send_long_message(bot, chat_id, buffer)
+
+
+async def start_process(command: list[str], bot: Bot, chat_id: int, state: FSMContext):
+    """Запускає процес та налаштовує передачу виводу"""
+    global active_process, output_task
+    
+    try:
+        # Створюємо процес
+        active_process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        
+        await bot.send_message(
+            chat_id,
+            f"✅ Процес запущено: `{' '.join(command)}`\nPID: {active_process.pid}",
+            parse_mode="Markdown"
+        )
+        
+        # Запускаємо читання виводу
+        output_task = asyncio.create_task(
+            asyncio.gather(
+                read_stream_and_send(active_process.stdout, bot, chat_id, "[OUT] "),
+                read_stream_and_send(active_process.stderr, bot, chat_id, "[ERR] ")
+            )
+        )
+        
+        await state.set_state(ProcessState.running)
+        
+        # Чекаємо завершення процесу
+        returncode = await active_process.wait()
+        await bot.send_message(
+            chat_id,
+            f"🏁 Процес завершено з кодом: {returncode}",
+            reply_markup=get_main_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Помилка запуску процесу: {e}")
+        await bot.send_message(chat_id, f"❌ Помилка: {e}")
+    finally:
+        active_process = None
+        output_task = None
+        await state.clear()
+
+
+async def stop_process(bot: Bot, chat_id: int, state: FSMContext):
+    """Зупиняє активний процес"""
+    global active_process, output_task
+    
+    if active_process and active_process.returncode is None:
+        try:
+            active_process.terminate()
+            await asyncio.sleep(1)
+            if active_process.returncode is None:
+                active_process.kill()
+            
+            if output_task:
+                output_task.cancel()
+            
+            await bot.send_message(chat_id, "🛑 Процес зупинено", reply_markup=get_main_keyboard())
+            await state.clear()
+        except Exception as e:
+            logger.error(f"Помилка зупинки процесу: {e}")
+            await bot.send_message(chat_id, f"❌ Помилка: {e}")
+    else:
+        await bot.send_message(chat_id, "⚠️ Немає активного процесу")
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Обробник команди /start"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        await message.answer("⛔ У вас немає доступу до цього бота")
+        return
+    
+    await message.answer(
+        "👋 Вітаю! Це бот для інтерактивного керування програмами.\n\n"
+        "🚀 Натисніть 'Start Program' для запуску\n"
+        "✍️ Надсилайте текст для вводу в програму\n"
+        "🛑 Натисніть 'Stop Program' для зупинки",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@router.message(F.text == "🚀 Start Program")
+async def button_start_program(message: Message, state: FSMContext):
+    """Кнопка запуску програми"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    if active_process and active_process.returncode is None:
+        await message.answer("⚠️ Програма вже запущена!")
+        return
+    
+    await message.answer(
+        "📝 Введіть команду для запуску (наприклад: `airodump-ng wlan0mon`)\n"
+        "Або використайте /cancel для скасування",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(ProcessState.waiting_input)
+
+
+@router.message(F.text == "🛑 Stop Program")
+async def button_stop_program(message: Message, state: FSMContext):
+    """Кнопка зупинки програми"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    await stop_process(message.bot, message.chat.id, state)
+
+
+@router.message(F.text == "📊 Status")
+async def button_status(message: Message):
+    """Кнопка статусу"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    if active_process and active_process.returncode is None:
+        await message.answer(
+            f"✅ Процес активний\nPID: {active_process.pid}",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer("⭕ Немає активного процесу", reply_markup=get_main_keyboard())
+
+
+@router.message(ProcessState.waiting_input)
+async def process_command_input(message: Message, state: FSMContext):
+    """Отримує команду для запуску"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    command = message.text.strip().split()
+    if not command:
+        await message.answer("❌ Порожня команда!")
+        return
+    
+    await message.answer(f"🔄 Запускаю: `{' '.join(command)}`...", parse_mode="Markdown")
+    
+    # Запускаємо процес в окремій задачі
+    asyncio.create_task(start_process(command, message.bot, message.chat.id, state))
+
+
+@router.message(ProcessState.running)
+async def process_stdin_input(message: Message, state: FSMContext):
+    """Передає ввід користувача в stdin процесу"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    global active_process
+    
+    if not active_process or active_process.returncode is not None:
+        await message.answer("⚠️ Процес не активний")
+        await state.clear()
+        return
+    
+    try:
+        user_input = message.text + "\n"
+        active_process.stdin.write(user_input.encode())
+        await active_process.stdin.drain()
+        logger.info(f"[INPUT] {message.text}")
+        await message.answer(f"✅ Надіслано: `{message.text}`", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Помилка запису в stdin: {e}")
+        await message.answer(f"❌ Помилка: {e}")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Скасування поточної операції"""
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    
+    await state.clear()
+    await message.answer("❌ Скасовано", reply_markup=get_main_keyboard())
+
+
+async def main():
+    """Головна функція запуску бота"""
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    
+    logger.info("Бот запущено...")
+    await dp.start_polling(bot)
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот зупинено")
