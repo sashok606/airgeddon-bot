@@ -62,6 +62,20 @@ def get_airgeddon_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def get_command_keyboard():
+    """Клавіатура для режиму командного рядка"""
+    keyboard = [
+        ["🔄 Оновити", "⛔ Ctrl+C"],
+        ["🔙 Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# Глобальні змінні для командного рядка
+command_process: Optional[asyncio.subprocess.Process] = None
+command_output: str = ""
+
+
 async def check_admin(update: Update) -> bool:
     """Перевірка чи користувач - адмін"""
     if update.effective_chat.id != ADMIN_CHAT_ID:
@@ -184,9 +198,10 @@ async def button_start_program(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(
         "💻 Режим командного рядка\n\n"
         "Введи команду для виконання:\n"
-        "Наприклад: `ls -la`, `ifconfig`, `ping google.com`",
+        "Наприклад: `ls -la`, `ifconfig`, `ping -c 3 google.com`\n\n"
+        "Натисни 🔙 Назад для виходу",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_command_keyboard()
     )
 
 
@@ -405,9 +420,30 @@ async def button_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка оновлення"""
+    global command_output
+    
     if not await check_admin(update):
         return
     
+    # Режим командного рядка
+    if waiting_command:
+        if command_output:
+            output = command_output
+            # Беремо останні 60 рядків
+            lines = output.strip().split('\n')
+            if len(lines) > 60:
+                output = '\n'.join(lines[-60:])
+                output = f"...(показано останні 60 рядків)\n{output}"
+            if len(output) > 4000:
+                output = output[-4000:]
+            await update.message.reply_text(f"📤 Останній вивід:\n```\n{output}\n```", 
+                                           parse_mode='Markdown',
+                                           reply_markup=get_command_keyboard())
+        else:
+            await update.message.reply_text("📭 Немає збереженого виводу", reply_markup=get_command_keyboard())
+        return
+    
+    # Режим airgeddon
     if active_process and active_process.returncode is None:
         try:
             active_process.stdin.write(b"refresh\n")
@@ -421,9 +457,49 @@ async def button_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_ctrlc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка Ctrl+C"""
+    global command_process, command_output
+    
     if not await check_admin(update):
         return
     
+    # Режим командного рядка
+    if waiting_command:
+        if command_process and command_process.returncode is None:
+            try:
+                import signal
+                import os as os_module
+                # Відправляємо SIGTERM всій групі процесів
+                os_module.killpg(os_module.getpgid(command_process.pid), signal.SIGTERM)
+                await asyncio.sleep(0.5)
+                # Якщо ще працює - SIGKILL
+                if command_process.returncode is None:
+                    os_module.killpg(os_module.getpgid(command_process.pid), signal.SIGKILL)
+                
+                # Показуємо останній вивід
+                if command_output:
+                    output = command_output
+                    lines = output.strip().split('\n')
+                    if len(lines) > 30:
+                        output = '\n'.join(lines[-30:])
+                    if len(output) > 3000:
+                        output = output[-3000:]
+                    await update.message.reply_text(f"⛔ Процес зупинено\n\n📤 Останній вивід:\n```\n{output}\n```", 
+                                                   parse_mode='Markdown',
+                                                   reply_markup=get_command_keyboard())
+                else:
+                    await update.message.reply_text("⛔ Процес зупинено", reply_markup=get_command_keyboard())
+            except Exception as e:
+                # Якщо killpg не працює - просто terminate
+                try:
+                    command_process.terminate()
+                    await update.message.reply_text("⛔ Процес зупинено", reply_markup=get_command_keyboard())
+                except:
+                    await update.message.reply_text(f"❌ Помилка: {e}", reply_markup=get_command_keyboard())
+        else:
+            await update.message.reply_text("⭕ Немає активного процесу", reply_markup=get_command_keyboard())
+        return
+    
+    # Режим airgeddon
     if active_process and active_process.returncode is None:
         try:
             active_process.stdin.write(b"ctrlc\n")
@@ -480,10 +556,17 @@ async def button_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def button_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка Назад - повернення в головне меню"""
-    global waiting_command, handshake_files
+    global waiting_command, handshake_files, command_process
     
     if not await check_admin(update):
         return
+    
+    # Зупиняємо процес якщо є
+    if command_process and command_process.returncode is None:
+        try:
+            command_process.terminate()
+        except:
+            pass
     
     waiting_command = False
     handshake_files = []
@@ -501,7 +584,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Ігноруємо якщо це кнопка
     buttons = ["🚀 Start Program", "📡 Airgeddon", "🛑 Stop Program", "📊 Status", 
-               "⏎ Enter", "🔄 Оновити", "✍️ Ввід", "⛔ Ctrl+C", "📦 Хендшейки", "🔙 Назад"]
+               "⏎ Enter", "🔄 Оновити", "✍️ Ввід", "⛔ Ctrl+C", "📦 Хендшейки", "🔙 Назад",
+               "🔄 Оновити", "⛔ Ctrl+C"]
     if text in buttons:
         return
     
@@ -517,34 +601,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Режим командного рядка
     if waiting_command:
+        global command_process, command_output
         try:
-            await update.message.reply_text(f"⏳ Виконую: {text}", reply_markup=get_command_keyboard())
+            await update.message.reply_text(f"⏳ Виконую: `{text}`\n\nНатисни 🔄 Оновити щоб побачити вивід\n⛔ Ctrl+C щоб зупинити", 
+                                           parse_mode='Markdown', reply_markup=get_command_keyboard())
             
-            # Виконуємо команду
-            process = await asyncio.create_subprocess_shell(
+            import os as os_module
+            # Виконуємо команду в новій групі процесів для можливості зупинки
+            command_process = await asyncio.create_subprocess_shell(
                 text,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
+                stderr=asyncio.subprocess.STDOUT,
+                preexec_fn=os_module.setsid  # Створюємо нову групу процесів
             )
             
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=60)
-            output = stdout.decode('utf-8', errors='replace')
+            command_output = ""
             
-            if output:
-                # Обрізаємо вивід якщо занадто довгий
-                if len(output) > 4000:
-                    output = output[:4000] + "\n...(обрізано)"
-                await update.message.reply_text(f"📤 Результат:\n```\n{output}\n```", 
-                                               parse_mode='Markdown',
-                                               reply_markup=get_command_keyboard())
-            else:
-                await update.message.reply_text("✅ Команда виконана (вивід пустий)", 
-                                               reply_markup=get_command_keyboard())
-        except asyncio.TimeoutError:
-            await update.message.reply_text("⏰ Таймаут (60 сек). Команда зупинена.", 
-                                           reply_markup=get_command_keyboard())
+            # Читаємо вивід асинхронно в фоні (не блокуємо!)
+            async def read_output():
+                global command_output, command_process
+                try:
+                    while command_process and command_process.returncode is None:
+                        try:
+                            line = await asyncio.wait_for(command_process.stdout.readline(), timeout=0.5)
+                            if not line:
+                                break
+                            command_output += line.decode('utf-8', errors='replace')
+                            # Обмежуємо розмір буфера
+                            if len(command_output) > 50000:
+                                command_output = command_output[-40000:]
+                        except asyncio.TimeoutError:
+                            continue
+                except:
+                    pass
+            
+            # Запускаємо читання в фоні - НЕ чекаємо!
+            asyncio.create_task(read_output())
+                
         except Exception as e:
             await update.message.reply_text(f"❌ Помилка: {e}", reply_markup=get_command_keyboard())
+            command_process = None
         return
     
     # Режим airgeddon
